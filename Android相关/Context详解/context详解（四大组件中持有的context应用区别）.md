@@ -76,9 +76,35 @@ if (activity != null) {
 
 **createBaseContextForActivity中创建ContextImpl:**
 ```
-    ContextImpl appContext = new ContextImpl(); 
-    appContext.init(r.packageInfo, r.token, this); 
-    appContext.setOuterContext(activity); 
+     private ContextImpl createBaseContextForActivity(ActivityClientRecord r) {
+        final int displayId;
+        try {
+            displayId = ActivityManager.getService().getActivityDisplayId(r.token);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+
+        ContextImpl appContext = ContextImpl.createActivityContext(
+                this, r.loadedApk, r.activityInfo, r.token, displayId, r.overrideConfig);
+
+        final DisplayManagerGlobal dm = DisplayManagerGlobal.getInstance();
+        // For debugging purposes, if the activity's package name contains the value of
+        // the "debug.use-second-display" system property as a substring, then show
+        // its content on a secondary display if there is one.
+        String pkgName = SystemProperties.get("debug.second-display.pkg");
+        if (pkgName != null && !pkgName.isEmpty()
+                && r.loadedApk.mPackageName.contains(pkgName)) {
+            for (int id : dm.getDisplayIds()) {
+                if (id != Display.DEFAULT_DISPLAY) {
+                    Display display =
+                            dm.getCompatibleDisplay(id, appContext.getResources());
+                    appContext = (ContextImpl) appContext.createDisplayContext(display);
+                    break;
+                }
+            }
+        }
+        return appContext;
+    }
     
 ```    
 #### 这个步骤中初始化时，将ActivityRecord中相关信息设置进了ContextImpl中！！！
@@ -195,23 +221,67 @@ private Context createBaseContextForActivity(ActivityClientRecord r, final Activ
 ```
 [-> ContextImpl.java]
 ```
-static ContextImpl createActivityContext(ActivityThread mainThread, LoadedApk packageInfo, int displayId, Configuration overrideConfiguration) {
-    return new ContextImpl(null, mainThread, packageInfo,
-            null, null, false,
-            null, overrideConfiguration, displayId);
-}
+    static ContextImpl createActivityContext(ActivityThread mainThread,
+            LoadedApk loadedApk, ActivityInfo activityInfo, IBinder activityToken, int displayId,
+            Configuration overrideConfiguration) {
+        if (loadedApk == null) throw new IllegalArgumentException("loadedApk");
+
+        String[] splitDirs = loadedApk.getSplitResDirs();
+        ClassLoader classLoader = loadedApk.getClassLoader();
+
+        if (loadedApk.getApplicationInfo().requestsIsolatedSplitLoading()) {
+            Trace.traceBegin(Trace.TRACE_TAG_RESOURCES, "SplitDependencies");
+            try {
+                classLoader = loadedApk.getSplitClassLoader(activityInfo.splitName);
+                splitDirs = loadedApk.getSplitPaths(activityInfo.splitName);
+            } catch (NameNotFoundException e) {
+                // Nothing above us can handle a NameNotFoundException, better crash.
+                throw new RuntimeException(e);
+            } finally {
+                Trace.traceEnd(Trace.TRACE_TAG_RESOURCES);
+            }
+        }
+
+        ContextImpl context = new ContextImpl(null, mainThread, loadedApk, activityInfo.splitName,
+                activityToken, null, 0, classLoader);
+
+        // Clamp display ID to DEFAULT_DISPLAY if it is INVALID_DISPLAY.
+        displayId = (displayId != Display.INVALID_DISPLAY) ? displayId : Display.DEFAULT_DISPLAY;
+
+        final CompatibilityInfo compatInfo = (displayId == Display.DEFAULT_DISPLAY)
+                ? loadedApk.getCompatibilityInfo()
+                : CompatibilityInfo.DEFAULT_COMPATIBILITY_INFO;
+
+        final ResourcesManager resourcesManager = ResourcesManager.getInstance();
+
+        // Create the base resources for which all configuration contexts for this Activity
+        // will be rebased upon.
+        context.setResources(resourcesManager.createBaseActivityResources(activityToken,
+                loadedApk.getResDir(),
+                splitDirs,
+                loadedApk.getOverlayDirs(),
+                loadedApk.getApplicationInfo().sharedLibraryFiles,
+                displayId,
+                overrideConfiguration,
+                compatInfo,
+                classLoader));
+        context.mDisplay = resourcesManager.getAdjustedDisplay(displayId,
+                context.getResources());
+        return context;
+    }
 ```
 
 **createAppContext**
 
 [-> ContextImpl.java]
 ```
-static ContextImpl createAppContext(ActivityThread mainThread, LoadedApk packageInfo) {
-    if (packageInfo == null) throw new IllegalArgumentException("packageInfo");
-    return new ContextImpl(null, mainThread, packageInfo,
-             null, null, false,
-             null, null, Display.INVALID_DISPLAY);
-}
+    static ContextImpl createAppContext(ActivityThread mainThread, LoadedApk loadedApk) {
+        if (loadedApk == null) throw new IllegalArgumentException("loadedApk");
+        ContextImpl context = new ContextImpl(null, mainThread, loadedApk, null, null, null, 0,
+                null);
+        context.setResources(loadedApk.getResources());
+        return context;
+    }
 ```
 
 **(三)Service初始化时创建ContextImpl**
